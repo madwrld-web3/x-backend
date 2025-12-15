@@ -15,10 +15,15 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI app
 app = FastAPI(title="X/CHANGE", description="Personal Crypto Exchange API")
 
-# Configure CORS
+# Configure CORS - UPDATED FOR VERCEL CONNECTION
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",                        # Local testing
+        "http://localhost:5173",                        # Vite local testing
+        "https://x-change-frontend-theta.vercel.app",   # <--- YOUR VERCEL APP
+        "https://x-change-frontend-theta.vercel.app/"   # (Trailing slash version)
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -132,7 +137,6 @@ async def approve_agent(request: ApproveAgentRequest):
     """
     Approve an agent wallet to trade on behalf of the user's main wallet.
     This uses the user's wallet to sign an approval on Hyperliquid.
-    
     IMPORTANT: This endpoint should be called with the signature from the frontend,
     but the actual approval transaction must be signed by the user's main wallet.
     """
@@ -242,7 +246,6 @@ async def get_positions(wallet_address: str):
 async def execute_trade(trade_request: TradeRequest):
     """
     Execute a trade on Hyperliquid using agent wallet.
-    
     The agent wallet signs the transaction, but trades on behalf of the main wallet.
     """
     try:
