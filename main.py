@@ -154,7 +154,7 @@ async def execute_trade(trade_request: TradeRequest):
         
         # Place market order
         order_result = exchange.market_open(
-            coin=trade_request.coin,
+            asset=trade_request.coin,
             is_buy=is_buy,
             sz=size_in_coins,
             slippage=0.05  # 5% slippage tolerance
