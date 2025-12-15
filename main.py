@@ -152,12 +152,14 @@ async def execute_trade(trade_request: TradeRequest):
         # Prepare order
         is_buy = trade_request.is_buy
         
-        # Place market order
+        # Place market order - use positional arguments as per Hyperliquid SDK
+        # market_open(coin, is_buy, sz, px=None, slippage=None, cloid=None, builder=None)
         order_result = exchange.market_open(
-            asset=trade_request.coin,
-            is_buy=is_buy,
-            sz=size_in_coins,
-            slippage=0.05  # 5% slippage tolerance
+            trade_request.coin,  # First positional arg: coin name
+            is_buy,              # Second positional arg: is_buy
+            size_in_coins,       # Third positional arg: size
+            None,                # Fourth positional arg: px (price, None for market)
+            0.05                 # Fifth positional arg: slippage
         )
         
         logger.info(f"Trade executed: {trade_request.coin} {'BUY' if is_buy else 'SELL'} "
