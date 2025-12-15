@@ -136,6 +136,19 @@ async def execute_trade(trade_request: TradeRequest):
             account_address=account.address
         )
         
+        # Get asset metadata for proper size rounding
+        meta = info.meta()
+        asset_info = next((asset for asset in meta["universe"] if asset["name"] == trade_request.coin), None)
+        
+        if not asset_info:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Asset {trade_request.coin} not found in metadata"
+            )
+        
+        # Get the szDecimals for proper rounding
+        sz_decimals = asset_info.get("szDecimals", 8)
+        
         # Calculate size in coins based on current price
         all_mids = info.all_mids()
         price = float(all_mids.get(trade_request.coin, 0))
@@ -146,8 +159,9 @@ async def execute_trade(trade_request: TradeRequest):
                 detail=f"Could not fetch price for {trade_request.coin}"
             )
         
-        # Calculate position size in coins
-        size_in_coins = trade_request.usd_size / price
+        # Calculate position size in coins and round to proper precision
+        raw_size = trade_request.usd_size / price
+        size_in_coins = round(raw_size, sz_decimals)
         
         # Prepare order
         is_buy = trade_request.is_buy
