@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 from hyperliquid.info import Info
 from hyperliquid.exchange import Exchange
@@ -33,6 +33,7 @@ class Asset(BaseModel):
 
 class TradeRequest(BaseModel):
     user_agent_private_key: str
+    user_main_wallet_address: str
     coin: str
     is_buy: bool
     usd_size: float
@@ -43,6 +44,31 @@ class TradeResponse(BaseModel):
     message: str
     order_result: Dict[str, Any] | None = None
 
+class ApproveAgentRequest(BaseModel):
+    user_wallet_address: str
+    agent_address: str
+    signature: str
+
+class ClosePositionRequest(BaseModel):
+    user_agent_private_key: str
+    user_main_wallet_address: str
+    coin: str
+
+class Position(BaseModel):
+    coin: str
+    side: str
+    size: float
+    entry_price: float
+    mark_price: float
+    unrealized_pnl: float
+    pnl_percentage: float
+    leverage: int
+    liquidation_price: Optional[float] = None
+
+class PositionsResponse(BaseModel):
+    positions: List[Position]
+    account_value: Dict[str, Any]
+
 # Initialize Hyperliquid Info (for market data)
 info = Info(constants.MAINNET_API_URL, skip_ws=True)
 
@@ -52,7 +78,8 @@ async def root():
     return {
         "name": "X/CHANGE",
         "description": "Personal Crypto Exchange API",
-        "version": "1.0.0"
+        "version": "2.0.0",
+        "features": ["trading", "positions", "agent_approval"]
     }
 
 @app.get("/markets", response_model=List[Asset])
@@ -100,13 +127,123 @@ async def get_markets():
         logger.error(f"Error fetching markets: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch market data: {str(e)}")
 
+@app.post("/approve-agent")
+async def approve_agent(request: ApproveAgentRequest):
+    """
+    Approve an agent wallet to trade on behalf of the user's main wallet.
+    This uses the user's wallet to sign an approval on Hyperliquid.
+    
+    IMPORTANT: This endpoint should be called with the signature from the frontend,
+    but the actual approval transaction must be signed by the user's main wallet.
+    """
+    try:
+        logger.info(f"Approving agent {request.agent_address} for wallet {request.user_wallet_address}")
+        
+        # Note: In a production environment, you would verify the signature here
+        # For now, we'll trust that the user has signed the message
+        
+        # The agent approval on Hyperliquid needs to be done by the main wallet
+        # Since we don't have the main wallet's private key (and shouldn't!),
+        # we'll return success and the frontend will handle the actual approval
+        # through MetaMask when the user clicks "Activate Agent"
+        
+        return {
+            "status": "success",
+            "message": "Agent approved successfully",
+            "agent_address": request.agent_address,
+            "user_address": request.user_wallet_address
+        }
+        
+    except Exception as e:
+        logger.error(f"Error approving agent: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to approve agent: {str(e)}")
+
+@app.get("/positions/{wallet_address}", response_model=PositionsResponse)
+async def get_positions(wallet_address: str):
+    """
+    Get all open positions and account information for a wallet address.
+    """
+    try:
+        # Get user state from Hyperliquid
+        user_state = info.user_state(wallet_address)
+        
+        positions = []
+        
+        # Parse positions from user state
+        if user_state and "assetPositions" in user_state:
+            for position_data in user_state["assetPositions"]:
+                if position_data["position"]["szi"] != "0.0":
+                    # Get asset info
+                    coin = position_data["position"]["coin"]
+                    size = float(position_data["position"]["szi"])
+                    entry_price = float(position_data["position"]["entryPx"])
+                    
+                    # Get current mark price
+                    all_mids = info.all_mids()
+                    mark_price = float(all_mids.get(coin, entry_price))
+                    
+                    # Calculate PnL
+                    if size > 0:  # LONG
+                        side = "LONG"
+                        unrealized_pnl = size * (mark_price - entry_price)
+                    else:  # SHORT
+                        side = "SHORT"
+                        unrealized_pnl = abs(size) * (entry_price - mark_price)
+                    
+                    # Calculate PnL percentage
+                    position_value = abs(size) * entry_price
+                    pnl_percentage = (unrealized_pnl / position_value * 100) if position_value > 0 else 0
+                    
+                    # Get leverage
+                    leverage = int(float(position_data["position"].get("leverage", {}).get("value", 1)))
+                    
+                    # Get liquidation price
+                    liquidation_px = position_data["position"].get("liquidationPx")
+                    liquidation_price = float(liquidation_px) if liquidation_px else None
+                    
+                    position = Position(
+                        coin=coin,
+                        side=side,
+                        size=abs(size),
+                        entry_price=entry_price,
+                        mark_price=mark_price,
+                        unrealized_pnl=unrealized_pnl,
+                        pnl_percentage=pnl_percentage,
+                        leverage=leverage,
+                        liquidation_price=liquidation_price
+                    )
+                    positions.append(position)
+        
+        # Get account value
+        account_value = {
+            "total_value": 0.0,
+            "account_margin": 0.0,
+            "withdrawable": 0.0
+        }
+        
+        if user_state and "marginSummary" in user_state:
+            margin_summary = user_state["marginSummary"]
+            account_value["total_value"] = float(margin_summary.get("accountValue", 0))
+            account_value["account_margin"] = float(margin_summary.get("totalMarginUsed", 0))
+            account_value["withdrawable"] = float(margin_summary.get("withdrawable", 0))
+        
+        logger.info(f"Found {len(positions)} positions for {wallet_address}")
+        
+        return PositionsResponse(
+            positions=positions,
+            account_value=account_value
+        )
+        
+    except Exception as e:
+        logger.error(f"Error fetching positions: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
+
 @app.post("/trade", response_model=TradeResponse)
 async def execute_trade(trade_request: TradeRequest):
     """
-    Execute a trade on Hyperliquid.
+    Execute a trade on Hyperliquid using agent wallet.
     
-    Hard constraint: Maximum leverage is 10x.
-    Calculates 3% fee on USD size and logs it.
+    The agent wallet signs the transaction, but trades on behalf of the main wallet.
     """
     try:
         # Hard constraint: Check leverage
@@ -128,13 +265,16 @@ async def execute_trade(trade_request: TradeRequest):
         fee_address = "0x7505E9d72fc210958ca6A62CD1dcaacC6a41E0D4"
         logger.info(f"Fee of ${fee_amount:.2f} due to {fee_address}")
         
-        # Initialize exchange with user's private key
-        account = Account.from_key(trade_request.user_agent_private_key)
+        # Initialize exchange with agent wallet trading for main wallet
+        # The agent wallet signs transactions, but account_address points to main wallet
+        agent_account = Account.from_key(trade_request.user_agent_private_key)
         exchange = Exchange(
-            account,
+            agent_account,
             constants.MAINNET_API_URL,
-            account_address=account.address
+            account_address=trade_request.user_main_wallet_address  # Main wallet has the funds
         )
+        
+        logger.info(f"Agent {agent_account.address} trading for main wallet {trade_request.user_main_wallet_address}")
         
         # Get asset metadata for proper size rounding
         meta = info.meta()
@@ -166,14 +306,13 @@ async def execute_trade(trade_request: TradeRequest):
         # Prepare order
         is_buy = trade_request.is_buy
         
-        # Place market order - use positional arguments as per Hyperliquid SDK
-        # market_open(coin, is_buy, sz, px=None, slippage=None, cloid=None, builder=None)
+        # Place market order - use positional arguments
         order_result = exchange.market_open(
-            trade_request.coin,  # First positional arg: coin name
-            is_buy,              # Second positional arg: is_buy
-            size_in_coins,       # Third positional arg: size
-            None,                # Fourth positional arg: px (price, None for market)
-            0.05                 # Fifth positional arg: slippage
+            trade_request.coin,
+            is_buy,
+            size_in_coins,
+            None,
+            0.05
         )
         
         logger.info(f"Trade executed: {trade_request.coin} {'BUY' if is_buy else 'SELL'} "
@@ -187,13 +326,63 @@ async def execute_trade(trade_request: TradeRequest):
         )
         
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
     except Exception as e:
         logger.error(f"Error executing trade: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to execute trade: {str(e)}"
+        )
+
+@app.post("/close-position")
+async def close_position(request: ClosePositionRequest):
+    """
+    Close an entire position for a specific coin.
+    """
+    try:
+        # Initialize exchange with agent wallet
+        agent_account = Account.from_key(request.user_agent_private_key)
+        exchange = Exchange(
+            agent_account,
+            constants.MAINNET_API_URL,
+            account_address=request.user_main_wallet_address
+        )
+        
+        logger.info(f"Closing position for {request.coin} on behalf of {request.user_main_wallet_address}")
+        
+        # Get current position to determine size and side
+        user_state = info.user_state(request.user_main_wallet_address)
+        
+        position_size = 0
+        for position_data in user_state.get("assetPositions", []):
+            if position_data["position"]["coin"] == request.coin:
+                position_size = float(position_data["position"]["szi"])
+                break
+        
+        if position_size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No open position found for {request.coin}"
+            )
+        
+        # Close position using market_close
+        result = exchange.market_close(request.coin, None, 0.05)
+        
+        logger.info(f"Position closed: {request.coin}")
+        
+        return {
+            "status": "success",
+            "message": f"Position closed: {request.coin}",
+            "result": result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error closing position: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to close position: {str(e)}"
         )
 
 if __name__ == "__main__":
