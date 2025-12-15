@@ -3,3 +3,4 @@ uvicorn==0.32.0
 pydantic==2.9.0
 hyperliquid-python-sdk==0.6.0
 eth-account==0.8.0
+setuptools>=65.5.0
