@@ -24,14 +24,13 @@ app = FastAPI(title="X/CHANGE", description="White Label Perpetual Exchange")
 # 1. CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow all for development
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # 2. IN-MEMORY AGENT STORAGE
-# Maps: user_wallet_address -> agent_private_key
 USER_AGENTS = {}
 
 # 3. HYPERLIQUID CONNECTION
@@ -48,6 +47,9 @@ class Asset(BaseModel):
 
 class AgentRequest(BaseModel):
     user_address: str
+
+class AccountRequest(BaseModel):
+    wallet_address: str
 
 class ApproveAgentRequest(BaseModel):
     user_wallet_address: str
@@ -72,6 +74,40 @@ class ClosePositionRequest(BaseModel):
 @app.get("/")
 async def root():
     return {"status": "online", "service": "X/CHANGE Backend", "agents_active": len(USER_AGENTS)}
+
+# --- NEW: ACCOUNT STATUS CHECK (THE FIX) ---
+@app.post("/api/account-status")
+async def get_account_status(req: AccountRequest):
+    """
+    Checks if the user exists on Hyperliquid.
+    If they have no history/balance, Hyperliquid returns an error.
+    We catch this and return a 'exists': False flag to trigger the Deposit UI.
+    """
+    address = req.wallet_address
+    try:
+        # Try to fetch user state
+        user_state = info.user_state(address)
+        
+        # If successful, calculate Account Value
+        margin_summary = user_state.get("marginSummary", {})
+        account_value = float(margin_summary.get("accountValue", 0.0))
+        
+        return {
+            "exists": True,
+            "account_value": account_value,
+            "needs_deposit": account_value < 10.0, 
+            "raw_state": user_state
+        }
+
+    except Exception as e:
+        # The SDK throws an error if the user has never interacted with Hyperliquid
+        logger.info(f"New user detected (no HL history): {address}")
+        return {
+            "exists": False,
+            "account_value": 0.0,
+            "needs_deposit": True,
+            "message": "User does not exist on Hyperliquid. Deposit required."
+        }
 
 # --- 1. MARKET DATA ---
 @app.get("/markets", response_model=List[Asset])
@@ -103,11 +139,9 @@ async def get_markets():
 @app.post("/generate-agent")
 async def generate_agent(data: AgentRequest):
     try:
-        # Create a fresh wallet
         priv_key = "0x" + secrets.token_hex(32)
         account = Account.from_key(priv_key)
         
-        # Store it in memory (use DB in prod)
         user_addr = data.user_address.lower()
         USER_AGENTS[user_addr] = priv_key
         
@@ -154,7 +188,7 @@ async def approve_agent(request: ApproveAgentRequest):
         logger.error(f"Approval exception: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 4. TRADING (Logic Restored) ---
+# --- 4. TRADING ---
 @app.post("/trade")
 async def execute_trade(trade: TradeRequest):
     user_addr = trade.user_address.lower()
@@ -162,40 +196,32 @@ async def execute_trade(trade: TradeRequest):
     if user_addr not in USER_AGENTS:
         raise HTTPException(status_code=400, detail="Agent not authorized. Click 'Activate Agent'.")
     
-    # Get secure key
     agent_private_key = USER_AGENTS[user_addr]
     agent_account = Account.from_key(agent_private_key)
 
     try:
         exchange = Exchange(agent_account, API_URL, account_address=trade.user_address)
 
-        # Calculate Size from USD
         all_mids = info.all_mids()
         price = float(all_mids.get(trade.coin))
         if not price:
             raise HTTPException(status_code=400, detail=f"Price not found for {trade.coin}")
             
-        # Get Decimals
         meta = info.meta()
         asset_info = next((a for a in meta["universe"] if a["name"] == trade.coin), None)
         decimals = asset_info["szDecimals"] if asset_info else 4
         
-        # Convert USD Size to Token Size
-        # Formula: (USD Amount * Leverage) / Price
-        # NOTE: Usually frontend sends Leverage separately. 
-        # Here we assume usd_size is the Margin. Total Position = Margin * Leverage
         position_value = trade.usd_size * trade.leverage
         size_token = round(position_value / price, decimals)
 
         logger.info(f"Executing Trade: {trade.coin} {size_token} units via Agent")
 
-        # Market Order
         order_result = exchange.market_open(
             trade.coin, 
             trade.is_buy, 
             size_token, 
             None, 
-            0.05 # 5% Slippage tolerance
+            0.05 
         )
         
         if order_result["status"] == "err":
