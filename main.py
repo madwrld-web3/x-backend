@@ -35,8 +35,6 @@ API_URL = constants.MAINNET_API_URL
 info = Info(API_URL, skip_ws=True)
 
 # 2. MASTER SECRET (Crucial for Deterministic Agents)
-# This ensures User X always gets Agent X.
-# In production, keep this safe!
 BACKEND_SECRET = b"WHITE_LABEL_EXCHANGE_MASTER_KEY_2024" 
 
 # --- HELPER: DERIVE AGENT ---
@@ -45,24 +43,8 @@ def get_user_agent(user_address: str) -> Account:
     Generates a stable, deterministic private key for a user.
     """
     user_clean = user_address.lower().strip()
-    # HMAC-SHA256(Secret, UserAddress) -> Private Key
     priv_key_raw = hmac.new(BACKEND_SECRET, user_clean.encode(), hashlib.sha256).hexdigest()
     return Account.from_key("0x" + priv_key_raw)
-
-# --- HELPER: CHECK AGENT APPROVAL ---
-def check_agent_approved(user_address: str, agent_address: str) -> bool:
-    """
-    Check if an agent wallet is approved for a user by querying their state.
-    Returns True if approved, False otherwise.
-    """
-    try:
-        user_state = info.user_state(user_address)
-        # The API doesn't directly expose approved agents, so we'll try to make a test order
-        # and check if it fails due to agent not being approved
-        return True  # We'll detect this through trade attempts
-    except Exception as e:
-        logger.error(f"Error checking agent approval: {e}")
-        return False
 
 # --- MODELS ---
 class Asset(BaseModel):
@@ -101,7 +83,6 @@ class ClosePositionRequest(BaseModel):
 async def root():
     return {"status": "online", "service": "X/CHANGE Backend"}
 
-# --- 1. MARKET DATA ---
 @app.get("/markets", response_model=List[Asset])
 async def get_markets():
     try:
@@ -124,7 +105,6 @@ async def get_markets():
         logger.error(f"Market data error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch markets")
 
-# --- 2. ACCOUNT STATUS ---
 @app.post("/api/account-status")
 async def get_account_status(req: AccountRequest):
     address = req.wallet_address.lower()
@@ -132,76 +112,96 @@ async def get_account_status(req: AccountRequest):
         user_state = info.user_state(address)
         margin_summary = user_state.get("marginSummary", {})
         account_value = float(margin_summary.get("accountValue", 0.0))
-        return {"exists": True, "account_value": account_value, "needs_deposit": account_value < 10.0}
-    except Exception:
+        
+        logger.info(f"Account {address}: ${account_value}")
+        
+        return {
+            "exists": account_value > 0,
+            "account_value": account_value,
+            "needs_deposit": account_value < 10.0
+        }
+    except Exception as e:
+        logger.error(f"Account status error for {address}: {e}")
         return {"exists": False, "account_value": 0.0, "needs_deposit": True}
 
-# --- 3. GENERATE AGENT (Deterministic) ---
 @app.post("/generate-agent")
 async def generate_agent(data: AgentRequest):
     try:
-        # Returns the SAME agent every time for this user
         account = get_user_agent(data.user_address)
+        logger.info(f"Agent {account.address} for user {data.user_address}")
         return {"agentAddress": account.address}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 4. APPROVE AGENT ---
 @app.post("/approve-agent")
 async def approve_agent(request: ApproveAgentRequest):
+    """
+    Submit agent approval to Hyperliquid.
+    The signature MUST come from the USER's wallet signing process.
+    """
     try:
+        user_address = request.user_wallet_address.lower()
+        agent_address = request.agent_address.lower()
+        
+        logger.info(f"Approving agent {agent_address} for user {user_address}")
+        
+        action = {
+            "type": "approveAgent",
+            "hyperliquidChain": "Mainnet",
+            "signatureChainId": "0xa4b1",
+            "agentAddress": agent_address,
+            "agentName": request.agent_name,
+            "nonce": request.nonce
+        }
+        
         payload = {
-            "action": {
-                "type": "approveAgent",
-                "hyperliquidChain": "Mainnet",
-                "signatureChainId": "0xa4b1",
-                "agentAddress": request.agent_address,
-                "agentName": request.agent_name,
-                "nonce": request.nonce
-            },
+            "action": action,
             "nonce": request.nonce,
             "signature": request.signature
         }
+        
         headers = {"Content-Type": "application/json"}
+        
+        logger.info(f"Submitting to Hyperliquid...")
+        
         res = requests.post(f"{API_URL}/exchange", json=payload, headers=headers)
         
+        logger.info(f"Response {res.status_code}: {res.text}")
+        
         if res.status_code != 200:
-            logger.error(f"Approval failed: {res.text}")
-            raise HTTPException(status_code=400, detail=f"Hyperliquid Approval Failed: {res.text}")
+            raise HTTPException(status_code=400, detail=f"HTTP {res.status_code}: {res.text}")
         
         response_data = res.json()
+        
         if response_data.get("status") == "err":
-            raise HTTPException(status_code=400, detail=f"Approval error: {response_data.get('response')}")
-            
+            error_msg = response_data.get("response", "Unknown error")
+            logger.error(f"Approval failed: {error_msg}")
+            raise HTTPException(status_code=400, detail=f"Approval error: {error_msg}")
+        
+        logger.info(f"Agent approved successfully!")
         return {"status": "success", "data": response_data}
+        
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Approve agent error: {e}")
+        logger.error(f"Approve agent error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 5. TRADE (FIXED & ENHANCED) ---
 @app.post("/trade")
 async def execute_trade(trade: TradeRequest):
-    """
-    Execute a trade using the user's approved agent wallet.
-    The agent must be pre-approved via the frontend flow.
-    """
+    """Execute a trade using the user's approved agent wallet."""
     try:
-        # 1. Re-derive the same agent key
         agent_account = get_user_agent(trade.user_address)
         
-        logger.info(f"Attempting trade for {trade.user_address} via agent {agent_account.address}")
+        logger.info(f"Trade: {trade.user_address} -> {trade.coin} {'BUY' if trade.is_buy else 'SELL'} ${trade.usd_size} @{trade.leverage}x")
+        logger.info(f"Agent: {agent_account.address}")
         
-        # 2. Create Exchange instance
-        # CRITICAL: account_address tells SDK which user account to trade for
         exchange = Exchange(
             wallet=agent_account,
             base_url=API_URL,
             account_address=trade.user_address
         )
 
-        # 3. Get current price & asset metadata
         all_mids = info.all_mids()
         price = float(all_mids.get(trade.coin, 0))
         if not price or price <= 0:
@@ -213,54 +213,40 @@ async def execute_trade(trade: TradeRequest):
             raise HTTPException(status_code=400, detail=f"Asset {trade.coin} not found")
         
         decimals = asset_info.get("szDecimals", 4)
-        
-        # 4. Calculate position size
-        # Formula: position_value = usd_size * leverage
-        # size_in_tokens = position_value / current_price
         position_value = trade.usd_size * trade.leverage
-        size_token = position_value / price
-        
-        # Round to correct decimals
-        size_token = round(size_token, decimals)
+        size_token = round(position_value / price, decimals)
         
         if size_token <= 0:
             raise HTTPException(status_code=400, detail="Position size too small")
         
-        logger.info(f"Trade details: {trade.coin} {'BUY' if trade.is_buy else 'SELL'} {size_token} tokens @ ~${price}")
-        logger.info(f"Position value: ${position_value:.2f} (size: ${trade.usd_size} × {trade.leverage}x leverage)")
+        logger.info(f"Executing: {size_token} tokens @ ~${price}")
 
-        # 5. Execute market order
-        # market_open params: coin, is_buy, sz, px (None for market), slippage
         order_result = exchange.market_open(
             coin=trade.coin,
             is_buy=trade.is_buy,
             sz=size_token,
-            px=None,  # None = market order
-            slippage=0.05  # 5% max slippage
+            px=None,
+            slippage=0.05
         )
         
-        logger.info(f"Order result: {order_result}")
+        logger.info(f"Result: {order_result}")
         
-        # 6. Check result
         if order_result.get("status") == "err":
             error_msg = order_result.get("response", "Unknown error")
             logger.error(f"Trade failed: {error_msg}")
             
-            # Check for common agent errors
-            if "does not exist" in str(error_msg).lower() or "api wallet" in str(error_msg).lower():
+            if any(keyword in str(error_msg).lower() for keyword in ["does not exist", "api wallet", "must deposit"]):
                 raise HTTPException(
                     status_code=400, 
-                    detail="Agent wallet not approved. Please activate your trading agent first."
+                    detail="Agent not approved. Click 'Activate Trading Agent' first."
                 )
             
             raise HTTPException(status_code=400, detail=str(error_msg))
         
-        # 7. Parse successful response
         response_data = order_result.get("response", {})
         data = response_data.get("data", {})
         statuses = data.get("statuses", [])
         
-        # Extract fill information
         fills = []
         for status in statuses:
             if "filled" in status:
@@ -281,10 +267,9 @@ async def execute_trade(trade: TradeRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Trade execution error: {e}", exc_info=True)
+        logger.error(f"Trade error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
 
-# --- 6. POSITIONS ---
 @app.get("/positions/{wallet_address}")
 async def get_positions(wallet_address: str):
     try:
@@ -317,7 +302,7 @@ async def get_positions(wallet_address: str):
             }
         }
     except Exception as e:
-        logger.error(f"Positions fetch error: {e}")
+        logger.error(f"Positions error: {e}")
         return {"positions": [], "account_value": {"total_value": 0, "withdrawable": 0}}
 
 @app.post("/close-position")
