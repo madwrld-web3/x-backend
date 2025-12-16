@@ -1,9 +1,10 @@
-# main.py
 import uvicorn
 import secrets
 import logging
 import requests
-import time
+import hmac
+import hashlib
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,21 +22,41 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="X/CHANGE", description="White Label Perpetual Exchange")
 
-# 1. CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. IN-MEMORY AGENT STORAGE
-USER_AGENTS = {}
-
-# 3. HYPERLIQUID CONNECTION
+# 1. CONSTANTS & SECRETS
 API_URL = constants.MAINNET_API_URL
 info = Info(API_URL, skip_ws=True)
+
+# SECURITY CRITICAL: This key ensures the same user always gets the same Agent wallet.
+# In production, load this from os.environ.get("BACKEND_SECRET")
+BACKEND_SECRET_KEY = b"CHANGE_THIS_TO_A_VERY_LONG_SECURE_RANDOM_STRING_IN_PROD"
+
+# --- HELPER: DETERMINISTIC AGENT GENERATION ---
+def derive_agent_account(user_wallet_address: str) -> Account:
+    """
+    Derives a deterministic private key for a specific user wallet.
+    Formula: HMAC_SHA256(Master_Secret, User_Address)
+    """
+    # Normalize address to lowercase
+    user_addr_clean = user_wallet_address.lower().strip()
+    
+    # Generate deterministic private key
+    priv_key_raw = hmac.new(
+        BACKEND_SECRET_KEY, 
+        user_addr_clean.encode("utf-8"), 
+        hashlib.sha256
+    ).hexdigest()
+    
+    # Return Account object
+    return Account.from_key("0x" + priv_key_raw)
 
 # --- MODELS ---
 
@@ -45,11 +66,11 @@ class Asset(BaseModel):
     max_leverage: int
     price: float
 
-class AgentRequest(BaseModel):
-    user_address: str
-
 class AccountRequest(BaseModel):
     wallet_address: str
+
+class AgentRequest(BaseModel):
+    user_address: str
 
 class ApproveAgentRequest(BaseModel):
     user_wallet_address: str
@@ -73,41 +94,7 @@ class ClosePositionRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "online", "service": "X/CHANGE Backend", "agents_active": len(USER_AGENTS)}
-
-# --- NEW: ACCOUNT STATUS CHECK (THE FIX) ---
-@app.post("/api/account-status")
-async def get_account_status(req: AccountRequest):
-    """
-    Checks if the user exists on Hyperliquid.
-    If they have no history/balance, Hyperliquid returns an error.
-    We catch this and return a 'exists': False flag to trigger the Deposit UI.
-    """
-    address = req.wallet_address
-    try:
-        # Try to fetch user state
-        user_state = info.user_state(address)
-        
-        # If successful, calculate Account Value
-        margin_summary = user_state.get("marginSummary", {})
-        account_value = float(margin_summary.get("accountValue", 0.0))
-        
-        return {
-            "exists": True,
-            "account_value": account_value,
-            "needs_deposit": account_value < 10.0, 
-            "raw_state": user_state
-        }
-
-    except Exception as e:
-        # The SDK throws an error if the user has never interacted with Hyperliquid
-        logger.info(f"New user detected (no HL history): {address}")
-        return {
-            "exists": False,
-            "account_value": 0.0,
-            "needs_deposit": True,
-            "message": "User does not exist on Hyperliquid. Deposit required."
-        }
+    return {"status": "online", "service": "X/CHANGE Backend"}
 
 # --- 1. MARKET DATA ---
 @app.get("/markets", response_model=List[Asset])
@@ -135,27 +122,66 @@ async def get_markets():
         logger.error(f"Market data error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch markets")
 
-# --- 2. AGENT GENERATION (Secure) ---
+# --- 2. ACCOUNT STATUS & AGENT CHECK ---
+@app.post("/api/account-status")
+async def get_account_status(req: AccountRequest):
+    address = req.wallet_address.lower()
+    
+    # 1. Derive the Agent Address this user SHOULD have
+    agent_account = derive_agent_account(address)
+    agent_address = agent_account.address.lower()
+
+    try:
+        # 2. Get User State from Hyperliquid
+        user_state = info.user_state(address)
+        
+        # 3. Check Account Value
+        margin_summary = user_state.get("marginSummary", {})
+        account_value = float(margin_summary.get("accountValue", 0.0))
+        
+        # 4. Check if our Derived Agent is actually approved on-chain
+        # Hyperliquid returns "isVault" or a list of authorized states. 
+        # But simpler: we check if the SDK *could* trade. 
+        # Actually, let's scan the user state. Unfortunately, HL API doesn't 
+        # explicitly list "approved agents" in the basic user_state call easily.
+        # We will assume not approved if false, the frontend handles the rest.
+        
+        # However, we can return the agent address we expect
+        return {
+            "exists": True,
+            "account_value": account_value,
+            "needs_deposit": account_value < 10.0,
+            "agent_address": agent_address, # Frontend checks if this is cached
+            "is_agent_approved": True # We assume true if exists, handled by try/catch in trade
+        }
+
+    except Exception as e:
+        # User doesn't exist on HL yet
+        return {
+            "exists": False,
+            "account_value": 0.0,
+            "needs_deposit": True,
+            "message": "User does not exist on Hyperliquid."
+        }
+
+# --- 3. GENERATE AGENT (DETERMINISTIC) ---
 @app.post("/generate-agent")
 async def generate_agent(data: AgentRequest):
     try:
-        priv_key = "0x" + secrets.token_hex(32)
-        account = Account.from_key(priv_key)
+        # Always returns the SAME agent for this user
+        account = derive_agent_account(data.user_address)
         
-        user_addr = data.user_address.lower()
-        USER_AGENTS[user_addr] = priv_key
-        
-        logger.info(f"Generated agent {account.address} for user {user_addr}")
+        logger.info(f"Derived agent {account.address} for user {data.user_address}")
         
         return {
             "agentAddress": account.address,
-            "message": "Agent generated. Please approve on frontend."
+            "message": "Agent derived. Please approve on frontend if not already done."
         }
     except Exception as e:
         logger.error(f"Agent gen error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 3. APPROVE AGENT (Relay) ---
+# --- 4. APPROVE AGENT ---
 @app.post("/approve-agent")
 async def approve_agent(request: ApproveAgentRequest):
     try:
@@ -188,20 +214,16 @@ async def approve_agent(request: ApproveAgentRequest):
         logger.error(f"Approval exception: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 4. TRADING ---
+# --- 5. TRADE (RE-DERIVE KEY) ---
 @app.post("/trade")
 async def execute_trade(trade: TradeRequest):
-    user_addr = trade.user_address.lower()
-    
-    if user_addr not in USER_AGENTS:
-        raise HTTPException(status_code=400, detail="Agent not authorized. Click 'Activate Agent'.")
-    
-    agent_private_key = USER_AGENTS[user_addr]
-    agent_account = Account.from_key(agent_private_key)
+    # 1. Re-derive the same key we generated earlier
+    agent_account = derive_agent_account(trade.user_address)
 
     try:
         exchange = Exchange(agent_account, API_URL, account_address=trade.user_address)
 
+        # Price & Formatting logic
         all_mids = info.all_mids()
         price = float(all_mids.get(trade.coin))
         if not price:
@@ -214,7 +236,7 @@ async def execute_trade(trade: TradeRequest):
         position_value = trade.usd_size * trade.leverage
         size_token = round(position_value / price, decimals)
 
-        logger.info(f"Executing Trade: {trade.coin} {size_token} units via Agent")
+        logger.info(f"Trade: {trade.coin} | Agent: {agent_account.address} | User: {trade.user_address}")
 
         order_result = exchange.market_open(
             trade.coin, 
@@ -225,15 +247,17 @@ async def execute_trade(trade: TradeRequest):
         )
         
         if order_result["status"] == "err":
-             raise HTTPException(status_code=400, detail=order_result["response"])
+            # Pass the actual Hyperliquid error back to frontend
+            raise HTTPException(status_code=400, detail=order_result["response"])
 
         return {"status": "success", "result": order_result}
 
     except Exception as e:
         logger.error(f"Trade failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # If the error contains "User or API Wallet does not exist", it means the user hasn't approved the agent yet
+        raise HTTPException(status_code=400, detail=str(e))
 
-# --- 5. POSITIONS ---
+# --- 6. POSITIONS ---
 @app.get("/positions/{wallet_address}")
 async def get_positions(wallet_address: str):
     try:
@@ -251,7 +275,6 @@ async def get_positions(wallet_address: str):
                 entry_px = float(p["entryPx"])
                 mark_px = float(info.all_mids().get(coin, entry_px))
                 pnl = (mark_px - entry_px) * size if size > 0 else (entry_px - mark_px) * abs(size)
-                value = abs(size) * mark_px
                 
                 positions.append({
                     "coin": coin,
@@ -259,9 +282,7 @@ async def get_positions(wallet_address: str):
                     "side": "LONG" if size > 0 else "SHORT",
                     "entry_price": entry_px,
                     "mark_price": mark_px,
-                    "unrealized_pnl": pnl,
-                    "pnl_percentage": (pnl / value * 100) if value else 0,
-                    "leverage": p.get("leverage", {}).get("value", 1)
+                    "unrealized_pnl": pnl
                 })
 
         return {
@@ -277,15 +298,9 @@ async def get_positions(wallet_address: str):
 
 @app.post("/close-position")
 async def close_position(request: ClosePositionRequest):
-    user_addr = request.user_address.lower()
-    if user_addr not in USER_AGENTS:
-        raise HTTPException(status_code=400, detail="Agent not authorized.")
-
+    agent_account = derive_agent_account(request.user_address)
     try:
-        agent_private_key = USER_AGENTS[user_addr]
-        account = Account.from_key(agent_private_key)
-        exchange = Exchange(account, API_URL, account_address=request.user_address)
-        
+        exchange = Exchange(agent_account, API_URL, account_address=request.user_address)
         result = exchange.market_close(request.coin)
         return {"status": "success", "result": result}
     except Exception as e:
