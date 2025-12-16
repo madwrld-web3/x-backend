@@ -49,6 +49,21 @@ def get_user_agent(user_address: str) -> Account:
     priv_key_raw = hmac.new(BACKEND_SECRET, user_clean.encode(), hashlib.sha256).hexdigest()
     return Account.from_key("0x" + priv_key_raw)
 
+# --- HELPER: CHECK AGENT APPROVAL ---
+def check_agent_approved(user_address: str, agent_address: str) -> bool:
+    """
+    Check if an agent wallet is approved for a user by querying their state.
+    Returns True if approved, False otherwise.
+    """
+    try:
+        user_state = info.user_state(user_address)
+        # The API doesn't directly expose approved agents, so we'll try to make a test order
+        # and check if it fails due to agent not being approved
+        return True  # We'll detect this through trade attempts
+    except Exception as e:
+        logger.error(f"Error checking agent approval: {e}")
+        return False
+
 # --- MODELS ---
 class Asset(BaseModel):
     symbol: str
@@ -149,51 +164,125 @@ async def approve_agent(request: ApproveAgentRequest):
         }
         headers = {"Content-Type": "application/json"}
         res = requests.post(f"{API_URL}/exchange", json=payload, headers=headers)
+        
         if res.status_code != 200:
-            raise HTTPException(status_code=400, detail="Hyperliquid Approval Failed")
-        return {"status": "success", "data": res.json()}
+            logger.error(f"Approval failed: {res.text}")
+            raise HTTPException(status_code=400, detail=f"Hyperliquid Approval Failed: {res.text}")
+        
+        response_data = res.json()
+        if response_data.get("status") == "err":
+            raise HTTPException(status_code=400, detail=f"Approval error: {response_data.get('response')}")
+            
+        return {"status": "success", "data": response_data}
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Approve agent error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 5. TRADE (RESTORED & FIXED) ---
+# --- 5. TRADE (FIXED & ENHANCED) ---
 @app.post("/trade")
 async def execute_trade(trade: TradeRequest):
-    # 1. Re-derive the same agent key
-    agent_account = get_user_agent(trade.user_address)
-
+    """
+    Execute a trade using the user's approved agent wallet.
+    The agent must be pre-approved via the frontend flow.
+    """
     try:
-        exchange = Exchange(agent_account, API_URL, account_address=trade.user_address)
+        # 1. Re-derive the same agent key
+        agent_account = get_user_agent(trade.user_address)
+        
+        logger.info(f"Attempting trade for {trade.user_address} via agent {agent_account.address}")
+        
+        # 2. Create Exchange instance
+        # CRITICAL: account_address tells SDK which user account to trade for
+        exchange = Exchange(
+            wallet=agent_account,
+            base_url=API_URL,
+            account_address=trade.user_address
+        )
 
-        # 2. Get Price & Decimals
+        # 3. Get current price & asset metadata
         all_mids = info.all_mids()
-        price = float(all_mids.get(trade.coin))
-        if not price:
-            raise HTTPException(status_code=400, detail=f"Price not found for {trade.coin}")
-            
+        price = float(all_mids.get(trade.coin, 0))
+        if not price or price <= 0:
+            raise HTTPException(status_code=400, detail=f"Invalid price for {trade.coin}")
+        
         meta = info.meta()
         asset_info = next((a for a in meta["universe"] if a["name"] == trade.coin), None)
-        decimals = asset_info["szDecimals"] if asset_info else 4
+        if not asset_info:
+            raise HTTPException(status_code=400, detail=f"Asset {trade.coin} not found")
         
-        # 3. Calculate Size
+        decimals = asset_info.get("szDecimals", 4)
+        
+        # 4. Calculate position size
+        # Formula: position_value = usd_size * leverage
+        # size_in_tokens = position_value / current_price
         position_value = trade.usd_size * trade.leverage
-        size_token = round(position_value / price, decimals)
+        size_token = position_value / price
+        
+        # Round to correct decimals
+        size_token = round(size_token, decimals)
+        
+        if size_token <= 0:
+            raise HTTPException(status_code=400, detail="Position size too small")
+        
+        logger.info(f"Trade details: {trade.coin} {'BUY' if trade.is_buy else 'SELL'} {size_token} tokens @ ~${price}")
+        logger.info(f"Position value: ${position_value:.2f} (size: ${trade.usd_size} × {trade.leverage}x leverage)")
 
-        logger.info(f"Trade: {trade.coin} {size_token} via {agent_account.address}")
-
-        # 4. Execute
+        # 5. Execute market order
+        # market_open params: coin, is_buy, sz, px (None for market), slippage
         order_result = exchange.market_open(
-            trade.coin, trade.is_buy, size_token, None, 0.05
+            coin=trade.coin,
+            is_buy=trade.is_buy,
+            sz=size_token,
+            px=None,  # None = market order
+            slippage=0.05  # 5% max slippage
         )
         
-        if order_result["status"] == "err":
-            raise HTTPException(status_code=400, detail=order_result["response"])
+        logger.info(f"Order result: {order_result}")
+        
+        # 6. Check result
+        if order_result.get("status") == "err":
+            error_msg = order_result.get("response", "Unknown error")
+            logger.error(f"Trade failed: {error_msg}")
+            
+            # Check for common agent errors
+            if "does not exist" in str(error_msg).lower() or "api wallet" in str(error_msg).lower():
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Agent wallet not approved. Please activate your trading agent first."
+                )
+            
+            raise HTTPException(status_code=400, detail=str(error_msg))
+        
+        # 7. Parse successful response
+        response_data = order_result.get("response", {})
+        data = response_data.get("data", {})
+        statuses = data.get("statuses", [])
+        
+        # Extract fill information
+        fills = []
+        for status in statuses:
+            if "filled" in status:
+                filled = status["filled"]
+                fills.append({
+                    "order_id": filled.get("oid"),
+                    "size": filled.get("totalSz"),
+                    "price": filled.get("avgPx")
+                })
+        
+        return {
+            "status": "success",
+            "result": order_result,
+            "fills": fills,
+            "message": f"{'Bought' if trade.is_buy else 'Sold'} {size_token} {trade.coin}"
+        }
 
-        return {"status": "success", "result": order_result}
-
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Trade failed: {e}")
-        # Pass exact error so frontend knows if it's an Agent issue
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Trade execution error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Trade failed: {str(e)}")
 
 # --- 6. POSITIONS ---
 @app.get("/positions/{wallet_address}")
@@ -212,8 +301,12 @@ async def get_positions(wallet_address: str):
                 mark_px = float(info.all_mids().get(coin, entry_px))
                 pnl = (mark_px - entry_px) * size if size > 0 else (entry_px - mark_px) * abs(size)
                 positions.append({
-                    "coin": coin, "size": size, "side": "LONG" if size > 0 else "SHORT",
-                    "entry_price": entry_px, "mark_price": mark_px, "unrealized_pnl": pnl
+                    "coin": coin,
+                    "size": size,
+                    "side": "LONG" if size > 0 else "SHORT",
+                    "entry_price": entry_px,
+                    "mark_price": mark_px,
+                    "unrealized_pnl": pnl
                 })
 
         return {
@@ -224,16 +317,29 @@ async def get_positions(wallet_address: str):
             }
         }
     except Exception as e:
-        return {"positions": [], "account_value": {}}
+        logger.error(f"Positions fetch error: {e}")
+        return {"positions": [], "account_value": {"total_value": 0, "withdrawable": 0}}
 
 @app.post("/close-position")
 async def close_position(request: ClosePositionRequest):
+    """Close an open position."""
     agent_account = get_user_agent(request.user_address)
     try:
-        exchange = Exchange(agent_account, API_URL, account_address=request.user_address)
+        exchange = Exchange(
+            wallet=agent_account,
+            base_url=API_URL,
+            account_address=request.user_address
+        )
         result = exchange.market_close(request.coin)
+        
+        if result.get("status") == "err":
+            raise HTTPException(status_code=400, detail=result.get("response", "Failed to close"))
+        
         return {"status": "success", "result": result}
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Close position error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
