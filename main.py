@@ -21,32 +21,24 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="X/CHANGE", description="White Label Perpetual Exchange")
 
-# 1. CORS (Kept your specific domains + added * for dev flexibility)
+# 1. CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://x-change-frontend-theta.vercel.app",
-        "https://x-change-frontend-theta.vercel.app/",
-        "*" # Added for easier local testing
-    ],
+    allow_origins=["*"], # Allow all for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # 2. IN-MEMORY AGENT STORAGE
-# Stores { "user_wallet_address": "agent_private_key" }
-# In production, replace this with a database (Redis/Postgres)
+# Maps: user_wallet_address -> agent_private_key
 USER_AGENTS = {}
 
 # 3. HYPERLIQUID CONNECTION
 API_URL = constants.MAINNET_API_URL
 info = Info(API_URL, skip_ws=True)
-BROKER_FEE_ADDRESS = "0x7505E9d72fc210958ca6A62CD1dcaacC6a41E0D4"
 
-# --- DATA MODELS ---
+# --- MODELS ---
 
 class Asset(BaseModel):
     symbol: str
@@ -64,14 +56,13 @@ class ApproveAgentRequest(BaseModel):
     nonce: int
     signature: Dict[str, Any]
 
-# Updated TradeRequest: No longer requires private key from frontend
 class TradeRequest(BaseModel):
-    user_address: str # Replaces user_main_wallet_address for consistency
+    user_address: str
     coin: str
     is_buy: bool
-    sz: float        # Size in tokens (or USD, logic handled below)
-    limit_px: float  # Limit price (set 0 for market)
-    
+    usd_size: float
+    leverage: int
+
 class ClosePositionRequest(BaseModel):
     user_address: str
     coin: str
@@ -82,7 +73,7 @@ class ClosePositionRequest(BaseModel):
 async def root():
     return {"status": "online", "service": "X/CHANGE Backend", "agents_active": len(USER_AGENTS)}
 
-# --- 1. MARKET DATA (Kept from your code) ---
+# --- 1. MARKET DATA ---
 @app.get("/markets", response_model=List[Asset])
 async def get_markets():
     try:
@@ -93,7 +84,6 @@ async def get_markets():
         
         for asset_info in meta["universe"]:
             symbol = asset_info["name"]
-            # Filter for specific coins or HIP (Hyperliquid Index perps)
             if symbol in target_coins or symbol.startswith("HIP"):
                 price = float(all_mids.get(symbol, 0))
                 asset = Asset(
@@ -109,17 +99,15 @@ async def get_markets():
         logger.error(f"Market data error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch markets")
 
-# --- 2. AGENT GENERATION (New Secure Flow) ---
+# --- 2. AGENT GENERATION (Secure) ---
 @app.post("/generate-agent")
 async def generate_agent(data: AgentRequest):
-    """
-    Generates a backend wallet for the user and stores the private key securely.
-    Returns the address so the frontend can approve it.
-    """
     try:
+        # Create a fresh wallet
         priv_key = "0x" + secrets.token_hex(32)
         account = Account.from_key(priv_key)
         
+        # Store it in memory (use DB in prod)
         user_addr = data.user_address.lower()
         USER_AGENTS[user_addr] = priv_key
         
@@ -127,18 +115,15 @@ async def generate_agent(data: AgentRequest):
         
         return {
             "agentAddress": account.address,
-            "message": "Agent generated. Please approve this address on frontend."
+            "message": "Agent generated. Please approve on frontend."
         }
     except Exception as e:
         logger.error(f"Agent gen error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 3. APPROVE AGENT (Relay to Hyperliquid) ---
+# --- 3. APPROVE AGENT (Relay) ---
 @app.post("/approve-agent")
 async def approve_agent(request: ApproveAgentRequest):
-    """
-    The frontend signs the permission, backend relays it to Hyperliquid API.
-    """
     try:
         logger.info(f"Relaying agent approval for {request.user_wallet_address}")
         
@@ -169,58 +154,52 @@ async def approve_agent(request: ApproveAgentRequest):
         logger.error(f"Approval exception: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 4. TRADING (Secure: Uses stored Agent Key) ---
+# --- 4. TRADING (Logic Restored) ---
 @app.post("/trade")
 async def execute_trade(trade: TradeRequest):
-    """
-    Executes a trade using the securely stored Agent Wallet.
-    """
     user_addr = trade.user_address.lower()
     
-    # Check if we have an agent for this user
     if user_addr not in USER_AGENTS:
-        raise HTTPException(status_code=400, detail="No agent found. Please click 'Authorize Agent' first.")
+        raise HTTPException(status_code=400, detail="Agent not authorized. Click 'Activate Agent'.")
     
-    # Retrieve the private key from memory
+    # Get secure key
     agent_private_key = USER_AGENTS[user_addr]
     agent_account = Account.from_key(agent_private_key)
 
     try:
-        # Initialize Exchange acting as the user
-        exchange = Exchange(
-            agent_account, 
-            API_URL, 
-            account_address=trade.user_address
-        )
+        exchange = Exchange(agent_account, API_URL, account_address=trade.user_address)
 
-        logger.info(f"Executing trade for {user_addr} via Agent {agent_account.address}")
-
-        # Execute Order (Limit or Market)
-        # Note: If limit_px is 0, we can treat it as market, or use specific market method
-        # Here we use the generic 'order' method which handles Gtc (Limit) well.
+        # Calculate Size from USD
+        all_mids = info.all_mids()
+        price = float(all_mids.get(trade.coin))
+        if not price:
+            raise HTTPException(status_code=400, detail=f"Price not found for {trade.coin}")
+            
+        # Get Decimals
+        meta = info.meta()
+        asset_info = next((a for a in meta["universe"] if a["name"] == trade.coin), None)
+        decimals = asset_info["szDecimals"] if asset_info else 4
         
-        # If you want Market Orders specifically:
-        if trade.limit_px == 0:
-             # Market Order Logic
-             # We need to fetch price to calculate slippage if using usd_size, 
-             # but here 'sz' is passed. Assuming 'sz' is in token units.
-             print(f"Market buying {trade.sz} {trade.coin}")
-             order_result = exchange.market_open(
-                 trade.coin, 
-                 trade.is_buy, 
-                 trade.sz, 
-                 None, 
-                 0.01 # 1% Slippage
-             )
-        else:
-            # Limit Order Logic
-            order_result = exchange.order(
-                name=trade.coin,
-                is_buy=trade.is_buy,
-                sz=trade.sz,
-                limit_px=trade.limit_px,
-                order_type={"limit": {"tif": "Gtc"}}
-            )
+        # Convert USD Size to Token Size
+        # Formula: (USD Amount * Leverage) / Price
+        # NOTE: Usually frontend sends Leverage separately. 
+        # Here we assume usd_size is the Margin. Total Position = Margin * Leverage
+        position_value = trade.usd_size * trade.leverage
+        size_token = round(position_value / price, decimals)
+
+        logger.info(f"Executing Trade: {trade.coin} {size_token} units via Agent")
+
+        # Market Order
+        order_result = exchange.market_open(
+            trade.coin, 
+            trade.is_buy, 
+            size_token, 
+            None, 
+            0.05 # 5% Slippage tolerance
+        )
+        
+        if order_result["status"] == "err":
+             raise HTTPException(status_code=400, detail=order_result["response"])
 
         return {"status": "success", "result": order_result}
 
@@ -228,7 +207,7 @@ async def execute_trade(trade: TradeRequest):
         logger.error(f"Trade failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 5. POSITIONS & CLOSING (Kept from your code) ---
+# --- 5. POSITIONS ---
 @app.get("/positions/{wallet_address}")
 async def get_positions(wallet_address: str):
     try:
@@ -273,16 +252,14 @@ async def get_positions(wallet_address: str):
 @app.post("/close-position")
 async def close_position(request: ClosePositionRequest):
     user_addr = request.user_address.lower()
-    
     if user_addr not in USER_AGENTS:
-        raise HTTPException(status_code=400, detail="No agent found. Authorize first.")
+        raise HTTPException(status_code=400, detail="Agent not authorized.")
 
     try:
         agent_private_key = USER_AGENTS[user_addr]
         account = Account.from_key(agent_private_key)
         exchange = Exchange(account, API_URL, account_address=request.user_address)
         
-        logger.info(f"Closing position {request.coin} for {request.user_address}")
         result = exchange.market_close(request.coin)
         return {"status": "success", "result": result}
     except Exception as e:
