@@ -1,11 +1,15 @@
 import uvicorn
 import logging
+import hmac
+import hashlib
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
+from eth_account import Account
 
 from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
 logging.basicConfig(level=logging.INFO)
@@ -21,11 +25,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Hyperliquid connection - read-only info
 API_URL = constants.MAINNET_API_URL
 info = Info(API_URL, skip_ws=True)
+BACKEND_SECRET = b"WHITE_LABEL_EXCHANGE_MASTER_KEY_2024"
 
-# --- MODELS ---
+def get_user_agent(user_address: str) -> Account:
+    user_clean = user_address.lower().strip()
+    priv_key_raw = hmac.new(BACKEND_SECRET, user_clean.encode(), hashlib.sha256).hexdigest()
+    return Account.from_key("0x" + priv_key_raw)
+
 class Asset(BaseModel):
     symbol: str
     name: str
@@ -35,7 +43,19 @@ class Asset(BaseModel):
 class AccountRequest(BaseModel):
     wallet_address: str
 
-# --- ENDPOINTS ---
+class AgentRequest(BaseModel):
+    user_address: str
+
+class TradeRequest(BaseModel):
+    user_address: str
+    coin: str
+    is_buy: bool
+    usd_size: float
+    leverage: int
+
+class ClosePositionRequest(BaseModel):
+    user_address: str
+    coin: str
 
 @app.get("/")
 async def root():
@@ -43,13 +63,11 @@ async def root():
 
 @app.get("/markets", response_model=List[Asset])
 async def get_markets():
-    """Get list of tradeable assets."""
     try:
         meta = info.meta()
         all_mids = info.all_mids()
         target_coins = {"BTC", "ETH", "SOL", "HYPE", "PAXG", "WIF", "PEPE"}
         assets = []
-        
         for asset_info in meta["universe"]:
             symbol = asset_info["name"]
             if symbol in target_coins or symbol.startswith("HIP"):
@@ -60,7 +78,6 @@ async def get_markets():
                     max_leverage=asset_info.get("maxLeverage", 50),
                     price=price
                 ))
-        
         return sorted(assets, key=lambda x: x.symbol)
     except Exception as e:
         logger.error(f"Market error: {e}")
@@ -68,27 +85,87 @@ async def get_markets():
 
 @app.post("/api/account-status")
 async def get_account_status(req: AccountRequest):
-    """Check if user has deposited and get account value."""
     address = req.wallet_address.lower()
     try:
         user_state = info.user_state(address)
         margin_summary = user_state.get("marginSummary", {})
         account_value = float(margin_summary.get("accountValue", 0.0))
-        
-        logger.info(f"Account {address}: ${account_value}")
-        
         return {
             "exists": account_value > 0,
             "account_value": account_value,
             "needs_deposit": account_value < 10.0
         }
     except Exception as e:
-        logger.error(f"Account status error: {e}")
         return {"exists": False, "account_value": 0.0, "needs_deposit": True}
+
+@app.post("/generate-agent")
+async def generate_agent(data: AgentRequest):
+    try:
+        account = get_user_agent(data.user_address)
+        logger.info(f"Agent: {account.address} for {data.user_address}")
+        return {"agentAddress": account.address}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/trade")
+async def execute_trade(trade: TradeRequest):
+    try:
+        agent_account = get_user_agent(trade.user_address)
+        
+        exchange = Exchange(
+            wallet=agent_account,
+            base_url=API_URL,
+            account_address=trade.user_address  # THIS IS KEY - trades for user's account
+        )
+
+        all_mids = info.all_mids()
+        price = float(all_mids.get(trade.coin, 0))
+        if not price:
+            raise HTTPException(status_code=400, detail=f"Invalid price")
+        
+        meta = info.meta()
+        asset_info = next((a for a in meta["universe"] if a["name"] == trade.coin), None)
+        if not asset_info:
+            raise HTTPException(status_code=400, detail="Asset not found")
+        
+        decimals = asset_info.get("szDecimals", 4)
+        position_value = trade.usd_size * trade.leverage
+        size_token = round(position_value / price, decimals)
+        
+        if size_token <= 0:
+            raise HTTPException(status_code=400, detail="Size too small")
+
+        order_result = exchange.market_open(
+            coin=trade.coin,
+            is_buy=trade.is_buy,
+            sz=size_token,
+            px=None,
+            slippage=0.05
+        )
+        
+        if order_result.get("status") == "err":
+            error_msg = order_result.get("response", "Unknown error")
+            raise HTTPException(status_code=400, detail=str(error_msg))
+        
+        fills = []
+        for status in order_result.get("response", {}).get("data", {}).get("statuses", []):
+            if "filled" in status:
+                fills.append({
+                    "order_id": status["filled"].get("oid"),
+                    "size": status["filled"].get("totalSz"),
+                    "price": status["filled"].get("avgPx")
+                })
+        
+        return {"status": "success", "result": order_result, "fills": fills}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Trade error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/positions/{wallet_address}")
 async def get_positions(wallet_address: str):
-    """Get user's open positions and account value."""
     try:
         user_state = info.user_state(wallet_address)
         positions = []
@@ -119,11 +196,25 @@ async def get_positions(wallet_address: str):
             }
         }
     except Exception as e:
-        logger.error(f"Positions error: {e}")
-        return {
-            "positions": [],
-            "account_value": {"total_value": 0, "withdrawable": 0}
-        }
+        return {"positions": [], "account_value": {"total_value": 0, "withdrawable": 0}}
+
+@app.post("/close-position")
+async def close_position(request: ClosePositionRequest):
+    agent_account = get_user_agent(request.user_address)
+    try:
+        exchange = Exchange(
+            wallet=agent_account,
+            base_url=API_URL,
+            account_address=request.user_address
+        )
+        result = exchange.market_close(request.coin)
+        if result.get("status") == "err":
+            raise HTTPException(status_code=400, detail=result.get("response"))
+        return {"status": "success", "result": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
